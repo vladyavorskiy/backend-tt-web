@@ -408,6 +408,16 @@ io.on('connection', (socket) => {
     console.log(`Пользователь ${sessionId} временно отключился`);
   });
 
+  socket.on('check_role', ({ roomId, userId }) => {
+  console.log(`[check_role] Received request: roomId=${roomId}, userId=${userId}`);
+
+  const room = activeRooms.get(roomId);
+  const isCreator = room?.creatorUserId === userId;
+
+  console.log(`[check_role] Computed isCreator=${isCreator} for userId=${userId} in roomId=${roomId}`);
+
+  socket.emit('role_info', { isCreator });
+});
 
 socket.on("create_game", async ({ type, mode, roundTime, wordsPerPlayer }) => {
   const roomId = socket.data.roomId;
@@ -595,12 +605,6 @@ socket.on("word_guessed", async () => {
     game.scores[guesserId] = (game.scores[guesserId] || 0) + 1;
 
     try {
-      // await query(
-      //   `UPDATE game_words SET guessed = TRUE
-      //    WHERE game_id = $1 AND word = $2`,
-      //   [game.id, guessedWord]
-      // );
-
       for (const playerId of [explainerId, guesserId]) {
         await query(
           `INSERT INTO game_scores (game_id, user_id, score)
@@ -635,11 +639,6 @@ socket.on("word_guessed", async () => {
     game.activePlayerIndex = 0;
 
     if (game.currentRound >= game.roundTime.length) {
-      // game.phase = "finished";
-      // io.to(roomId).emit("phase_changed", {
-      //   phase: "finished",
-      //   scores: game.scores,
-      // });
       await finishGame(roomId);
       return;
     }
@@ -667,12 +666,6 @@ socket.on("end_game_early", async () => {
   const roomId = socket.data.roomId;
   const game = activeRooms.get(roomId)?.currentGame;
   if (!game) return;
-
-  // game.phase = "finished";
-  // io.to(roomId).emit("phase_changed", {
-  //   phase: "finished",
-  //   scores: game.scores,
-  // });
   await finishGame(roomId);
 });
 
@@ -682,7 +675,6 @@ socket.on("start_game_request", () => {
   if (!room || room.creatorUserId !== socket.data.userId) return;
 
   io.to(roomId).emit("game_started");
-  io.to(roomId).emit("phase_changed", { phase: "setup" });
 });
 
 function startTurnTimer(duration, roomId, game, socket) {
