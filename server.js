@@ -44,18 +44,30 @@ function broadcastParticipants(roomId, roomData) {
 async function removeUserFromRoomBySession(sessionId) {
   const roomId = sessionToRoom.get(sessionId);
   if (!roomId) return;
+  
   const roomData = activeRooms.get(roomId);
   if (!roomData) return;
 
   const user = roomData.participants.get(sessionId);
   if (!user) return;
 
+  const userName = user.name || 'Неизвестный пользователь';
+
   roomData.participants.delete(sessionId);
-  roomData.users.delete(user.userId);
   sessionToRoom.delete(sessionId);
   await query('DELETE FROM room_users WHERE session_id = $1', [sessionId]);
 
+   const leaveMessage = `${userName} вышел из комнаты`;
+  await query(
+    'INSERT INTO messages (room_id, sender_name, message) VALUES ($1, $2, $3)',
+    [roomId, 'Система', leaveMessage]);
+ 
+    io.to(roomId).emit('receive_message', { from: { id: 'system', name: 'Система' }, text: leaveMessage });
   broadcastParticipants(roomId, roomData);
+}
+
+function shuffleArray(array) {
+  return array.sort(() => Math.random() - 0.5);
 }
 
 // API: Пользователи
@@ -196,6 +208,71 @@ app.post('/api/rooms', async (req, res) => {
 });
 
 
+
+async function finishGame(roomId) {
+  try {
+    const room = activeRooms.get(roomId);
+    if (!room) return;
+    const game = room.currentGame;
+    if (!game) return;
+
+    try {
+      await query(`UPDATE games SET ended_at = NOW() WHERE id = $1`, [game.id]);
+    } catch (err) {
+      console.warn("finishGame: couldn't set ended_at (maybe column absent).", err.message || err);
+    }
+
+    if (game.scores && Object.keys(game.scores).length > 0) {
+      const entries = Object.entries(game.scores);
+      for (const [userIdStr, scoreValue] of entries) {
+        const userId = Number(userIdStr);
+        await query(
+          `INSERT INTO game_scores (game_id, user_id, score)
+           VALUES ($1, $2, $3)
+           ON CONFLICT (game_id, user_id)
+           DO UPDATE SET score = EXCLUDED.score`,
+          [game.id, userId, Number(scoreValue) || 0]
+        );
+      }
+    }
+
+    const scoreText = Object.entries(game.scores || {})
+      .map(([uid, sc]) => {
+        let name = "Игрок";
+        try {
+          for (const [, p] of (room.participants || [])) {
+          }
+        } catch (e) {  }
+        if (room.participants) {
+          for (const p of room.participants.values()) {
+            if (p && Number(p.userId) === Number(uid)) { name = p.name || name; break; }
+          }
+        }
+        return `${name}: ${sc}`;
+      })
+      .join(", ");
+
+    const leaveMessage = scoreText.length ? `Игра завершена — итоговый счёт: ${scoreText}` : `Игра завершена.`;
+
+    try {
+      await query(
+        `INSERT INTO messages (room_id, user_id, sender_name, message)
+         VALUES ($1, NULL, $2, $3)`,
+        [roomId, 'Система', leaveMessage]
+      );
+    } catch (err) {
+      console.warn("finishGame: failed to insert message", err.message || err);
+    }
+
+    game.phase = "finished";
+    io.to(roomId).emit("phase_changed", { phase: "finished", scores: game.scores });
+    io.to(roomId).emit("receive_message", { from: { id: 'system', name: 'Система' }, text: leaveMessage });
+    console.log(`finishGame: game ${game.id} finished for room ${roomId}`);
+  } catch (err) {
+    console.error("finishGame error:", err);
+  }
+}
+
 // SOCKET.IO
 
 io.on('connection', (socket) => {
@@ -330,6 +407,363 @@ io.on('connection', (socket) => {
 
     console.log(`Пользователь ${sessionId} временно отключился`);
   });
+
+
+socket.on("create_game", async ({ type, mode, roundTime, wordsPerPlayer }) => {
+  const roomId = socket.data.roomId;
+  const userId = socket.data.userId;
+  const room = activeRooms.get(roomId);
+  if (!room) return;
+
+  try {
+    const gameRes = await query(
+      `INSERT INTO games (room_id, creator_user_id, type, mode, round_time, words_per_player)
+       VALUES ($1, $2, $3, $4, $5, $6)
+       RETURNING id`,
+      [roomId, userId, type, mode, roundTime, wordsPerPlayer]
+    );
+
+    const gameId = gameRes.rows[0].id;
+
+  const game = {
+    id: gameId,
+    type,               // тип игры
+    mode,               // solo / team
+    roundTime,          // время на раунд
+    wordsPerPlayer,     // сколько слов вводит каждый игрок
+    phase: "enterWords",
+    allWords: [],       // все слова, введённые игроками
+    roundWords: [],     // слова текущего раунда
+    guessedWords: [],   // угаданные слова
+    pairs: [],          // для solo режима
+    teams: [[], []],    // для team режима
+    scores: {},         // очки
+    currentRound: 0,
+    activePlayerIndex: 0,
+    wordsSubmitted: new Set(),
+  };
+
+  room.currentGame = game;
+
+  io.to(roomId).emit("phase_changed", {
+    phase: "enterWords",
+    roundTime,
+    wordsPerPlayer,
+  });
+  } catch (err) {
+    console.error("Ошибка при создании игры:", err);
+    socket.emit("error_message", "Ошибка при создании игры");
+  }
+});
+
+socket.on("submit_words", async ({ words }) => {
+  const roomId = socket.data.roomId;
+  const userId = socket.data.userId;
+  const room = activeRooms.get(roomId);
+  const game = room?.currentGame;
+  if (!game || game.phase !== "enterWords") return;
+
+  try {
+    const insertValues = words.map(
+      (word, idx) => `('${game.id}', ${userId}, '${word.replace(/'/g, "''")}')`
+    ).join(',');
+
+    await query(
+      `INSERT INTO game_words (game_id, user_id, word)
+       VALUES ${insertValues}`
+    );
+
+  game.wordsSubmitted.add(socket.data.userId);
+  game.allWords.push(...words);
+
+  if (game.wordsSubmitted.size === room.participants.size) {
+    game.roundWords = shuffleArray([...game.allWords]);
+    game.currentRound = 0;
+    game.activePlayerIndex = 0;
+    game.phase = "prepare_round";
+
+    const participantsArray = Array.from(room.participants.values()).map(p => ({
+      id: p.userId,
+      name: p.name,
+    }));
+    
+    io.to(roomId).emit("phase_changed", {
+      phase: "prepare_round",
+      round: game.currentRound,
+      type: game.type,
+      mode: game.mode,
+      roundTime: game.roundTime,
+      wordsPerPlayer: game.wordsPerPlayer,
+      participants: participantsArray,
+    });
+  } else {
+    io.to(roomId).emit("waiting_for_players", {
+      submitted: game.wordsSubmitted.size,
+      total: room.participants.size,
+    });
+  }
+  } catch (err) {
+    console.error("Ошибка при сохранении слов:", err);
+    socket.emit("error_message", "Ошибка при сохранении слов");
+  }
+});
+
+socket.on("set_pairs", ({ pairs }) => {
+  const roomId = socket.data.roomId;
+  const game = activeRooms.get(roomId)?.currentGame;
+  if (!game || game.mode !== "solo") return;
+
+  game.pairs = pairs;
+  game.activePlayerIndex = 0;
+  game.phase = "game";
+
+  const firstPair = pairs[0];
+
+  io.to(roomId).emit("phase_changed", {
+    phase: "game",
+    currentWord: null,
+    activePlayerId: firstPair.explainer.id,
+    guesserId: firstPair.guesser.id,
+    round: game.currentRound,
+    scores: game.scores,
+  });
+});
+
+socket.on("set_teams", ({ teams }) => {
+  const roomId = socket.data.roomId;
+  const game = activeRooms.get(roomId)?.currentGame;
+  if (!game || game.mode !== "team") return;
+
+  game.teams = teams;
+  game.activePlayerIndex = 0;
+  game.phase = "game";
+
+  const explainerId = teams[0][0];
+  const guesserId = teams[1][0];
+  game.roundWords = shuffleArray([...game.allWords]);
+
+  io.to(roomId).emit("phase_changed", {
+    phase: "game",
+    currentWord: null,
+    activePlayerId: explainerId,
+    guesserId,
+    round: game.currentRound,
+    scores: game.scores,
+  });
+});
+
+socket.on("player_ready", () => {
+  const roomId = socket.data.roomId;
+  const game = activeRooms.get(roomId)?.currentGame;
+  if (!game || game.phase !== "game") return;
+
+  let currentPair;
+  if (game.mode === "solo") {
+    currentPair = game.pairs[game.activePlayerIndex];
+  } else {
+    currentPair = {
+      explainer: { id: game.teams[0][game.activePlayerIndex] },
+      guesser: { id: game.teams[1][game.activePlayerIndex] },
+    };
+  }
+
+  if (socket.data.userId !== currentPair.explainer.id) return;
+
+  const word = game.roundWords[0] || null;
+  io.to(socket.id).emit("reveal_word", { word });
+
+  const duration = game.roundTime[game.currentRound];
+  startTurnTimer(duration, roomId, game, socket);
+});
+
+socket.on("word_guessed", async () => {
+  const roomId = socket.data.roomId;
+  const room = activeRooms.get(roomId);
+  const game = activeRooms.get(roomId)?.currentGame;
+  if (!game || game.roundWords.length === 0) return;
+
+  const guessedWord = game.roundWords.shift();
+  game.guessedWords.push(guessedWord);
+
+  let currentPair;
+ if (game.mode === "solo") {
+    currentPair = game.pairs[game.activePlayerIndex];
+    const explainerId = currentPair.explainer.id;
+    const guesserId = currentPair.guesser.id;
+
+    game.scores[explainerId] = (game.scores[explainerId] || 0) + 1;
+    game.scores[guesserId] = (game.scores[guesserId] || 0) + 1;
+
+    try {
+      // await query(
+      //   `UPDATE game_words SET guessed = TRUE
+      //    WHERE game_id = $1 AND word = $2`,
+      //   [game.id, guessedWord]
+      // );
+
+      for (const playerId of [explainerId, guesserId]) {
+        await query(
+          `INSERT INTO game_scores (game_id, user_id, score)
+           VALUES ($1, $2, 1)
+           ON CONFLICT (game_id, user_id)
+           DO UPDATE SET score = game_scores.score + 1`,
+          [game.id, playerId]
+        );
+      }
+    } catch (err) {
+      console.error("Ошибка обновления очков:", err);
+    }
+  } else {
+    currentPair = {
+      explainer: { id: game.teams[0][game.activePlayerIndex] },
+      guesser: { id: game.teams[1][game.activePlayerIndex] },
+    };
+  }
+
+  if (game.roundWords.length > 0) {
+    console.log(game.roundWords);
+    const nextWord = game.roundWords[0];
+    console.log(nextWord);
+    io.to(currentPair.explainer.id).emit("reveal_word", { word: nextWord });
+    io.to(roomId).emit("next_word", {
+      word: nextWord,
+      scores: game.scores,
+    });
+  } else {
+    game.phase = "prepare_round";
+    game.currentRound++;
+    game.activePlayerIndex = 0;
+
+    if (game.currentRound >= game.roundTime.length) {
+      // game.phase = "finished";
+      // io.to(roomId).emit("phase_changed", {
+      //   phase: "finished",
+      //   scores: game.scores,
+      // });
+      await finishGame(roomId);
+      return;
+    }
+
+    game.roundWords = shuffleArray([...game.allWords]);
+
+    io.to(roomId).emit("phase_changed", {
+      phase: "prepare_round",
+      round: game.currentRound,
+      scores: game.scores,
+    });
+  }
+});
+
+socket.on("end_turn", () => {
+  const roomId = socket.data.roomId;
+  const game = activeRooms.get(roomId)?.currentGame;
+  if (!game || game.phase !== "game") return;
+
+  endTurnServer(roomId, game);
+});
+
+
+socket.on("end_game_early", async () => {
+  const roomId = socket.data.roomId;
+  const game = activeRooms.get(roomId)?.currentGame;
+  if (!game) return;
+
+  // game.phase = "finished";
+  // io.to(roomId).emit("phase_changed", {
+  //   phase: "finished",
+  //   scores: game.scores,
+  // });
+  await finishGame(roomId);
+});
+
+socket.on("start_game_request", () => {
+  const roomId = socket.data.roomId;
+  const room = activeRooms.get(roomId);
+  if (!room || room.creatorUserId !== socket.data.userId) return;
+
+  io.to(roomId).emit("game_started");
+  io.to(roomId).emit("phase_changed", { phase: "setup" });
+});
+
+function startTurnTimer(duration, roomId, game, socket) {
+  let timeLeft = duration;
+
+  const interval = setInterval(() => {
+    if (!game || game.phase !== "game") {
+      clearInterval(interval);
+      return;
+    }
+
+    io.to(roomId).emit("update_timer", { timeLeft });
+
+    timeLeft -= 1;
+    if (timeLeft < 0) {
+      clearInterval(interval);
+      endTurnServer(roomId, game);
+    }
+  }, 1000);
+}
+
+
+async function endTurnServer(roomId, game) {
+  try {
+    if (!game) return;
+
+    game.activePlayerIndex++;
+    const totalPairs =
+      game.mode === "solo"
+        ? (Array.isArray(game.pairs) ? game.pairs.length : 0)
+        : Math.min((game.teams[0] || []).length, (game.teams[1] || []).length);
+
+    if (game.activePlayerIndex >= totalPairs) {
+      game.activePlayerIndex = 0;
+
+      if (!game.roundWords || game.roundWords.length === 0) {
+        game.currentRound++;
+
+        game.pairs = [];
+
+        if (game.currentRound >= (Array.isArray(game.roundTime) ? game.roundTime.length : 0)) {
+          await finishGame(roomId);
+          return;
+        }
+
+        game.roundWords = shuffleArray(game.allWords.filter(w => !game.guessedWords.includes(w)));
+        game.phase = "prepare_round";
+
+        io.to(roomId).emit("phase_changed", {
+          phase: "prepare_round",
+          round: game.currentRound,
+          scores: game.scores
+        });
+
+        return;
+      }
+    }
+
+    let nextPair;
+    if (game.mode === "solo") {
+      nextPair = game.pairs[game.activePlayerIndex] || null;
+    } else {
+      nextPair = {
+        explainer: { id: (game.teams[0] || [])[game.activePlayerIndex] },
+        guesser: { id: (game.teams[1] || [])[game.activePlayerIndex] }
+      };
+    }
+
+    io.to(roomId).emit("turn_changed", {
+      activePlayerId: nextPair?.explainer?.id || null,
+      guesserId: nextPair?.guesser?.id || null,
+      word: null,
+      round: game.currentRound,
+      scores: game.scores,
+    });
+  } catch (err) {
+    console.error("endTurnServer error:", err);
+  }
+}
+
+
 });
 
 
