@@ -518,12 +518,14 @@ socket.on("create_game", async ({ type, mode, roundTime, wordsPerPlayer }) => {
   };
 
   room.currentGame = game;
-
+  console.log(room.participants.size);
   io.to(roomId).emit("phase_changed", {
     phase: "enterWords",
     roundTime,
     wordsPerPlayer,
+    waitingStatus: { submitted: 0, total: room.participants.size }
   });
+  
   } catch (err) {
     console.error("Ошибка при создании игры:", err);
     socket.emit("error_message", "Ошибка при создании игры");
