@@ -278,6 +278,31 @@ async function finishGame(roomId) {
 io.on('connection', (socket) => {
   console.log('Подключен:', socket.id);
 
+  socket.on('check_active_room', async ({ userId }) => {
+    try {
+      for (const [roomId, room] of activeRooms.entries()) {
+        const participant = Array.from(room.participants.values()).find(p => p.userId === userId);
+        if (participant) {
+          socket.emit('active_room_info', { roomId });
+          return;
+        }
+      }
+
+      const dbCheck = await query(
+        `SELECT room_id FROM room_users WHERE user_id = $1 LIMIT 1`,
+        [userId]
+      );
+      if (dbCheck.rowCount > 0) {
+        socket.emit('active_room_info', { roomId: dbCheck.rows[0].room_id });
+      } else {
+        socket.emit('active_room_info', null);
+      }
+    } catch (err) {
+      console.error('[check_active_room]', err);
+      socket.emit('active_room_info', null);
+    }
+  });
+
   socket.on('join_room', async (data) => {
     const { roomId, userId, sessionId: providedSessionId } = data || {};
     if (!roomId || !userId) return socket.emit('error_message', 'Неверные параметры join_room');
@@ -310,29 +335,66 @@ io.on('connection', (socket) => {
 
       const roomData = activeRooms.get(roomId);
       const userRes = await query('SELECT username FROM users WHERE id = $1', [userId]);
-      const username = userRes.rows[0].username;
+      const username = userRes.rows[0]?.username || 'Неизвестный пользователь';
+      
+      // const isFirstJoin = !roomData.participants.has(sessionKey);
+      // roomData.participants.set(sessionKey, { userId, name: username, socketId: socket.id, sessionId: sessionKey });
 
-      const isFirstJoin = !roomData.participants.has(sessionKey);
-      roomData.participants.set(sessionKey, { userId, name: username, socketId: socket.id, sessionId: sessionKey });
+      let existingParticipant = Array.from(roomData.participants.values()).find(p => p.userId === userId);
+
+      if (existingParticipant) {
+        // Пользователь уже в комнате — обновляем socketId и sessionId
+        console.log(`[join_room] Пользователь ${userId} уже в комнате ${roomId}, обновляем socketId`);
+        existingParticipant.socketId = socket.id;
+        existingParticipant.sessionId = sessionKey;
+
+        await query(
+          `UPDATE room_users SET socket_id = $1, session_id = $2 WHERE room_id = $3 AND user_id = $4`,
+          [socket.id, sessionKey, roomId, userId]
+        );
+      } else {
+        console.log(`[join_room] Новый участник ${userId} вошел в комнату ${roomId}`);
+        roomData.participants.set(sessionKey, { userId, name: username, socketId: socket.id, sessionId: sessionKey });
+
+        await query(
+          `INSERT INTO room_users (room_id, user_id, session_id, socket_id) VALUES ($1, $2, $3, $4)`,
+          [roomId, userId, sessionKey, socket.id]
+        );
+      }
+
       sessionToRoom.set(sessionKey, roomId);
 
-      await query(
-        `INSERT INTO room_users (room_id, user_id, session_id, socket_id)
-         VALUES ($1, $2, $3, $4)
-         ON CONFLICT (room_id, session_id)
-         DO UPDATE SET socket_id = EXCLUDED.socket_id, user_id = EXCLUDED.user_id`,
-        [roomId, userId, sessionKey, socket.id]
-      );
-
       socket.join(roomId);
+
+      // await query(
+      //   `INSERT INTO room_users (room_id, user_id, session_id, socket_id)
+      //    VALUES ($1, $2, $3, $4)
+      //    ON CONFLICT (room_id, session_id)
+      //    DO UPDATE SET socket_id = EXCLUDED.socket_id, user_id = EXCLUDED.user_id`,
+      //   [roomId, userId, sessionKey, socket.id]
+      // );
+
 
       const messagesRes = await query('SELECT sender_name, message, created_at FROM messages WHERE room_id = $1 ORDER BY created_at ASC', [roomId]);
       socket.emit('chat_history', messagesRes.rows || []);
 
-      if (isFirstJoin && userId !== roomData.creatorUserId) {
-        const joinMessage = `${username} присоединился к комнате`;
-        await query('INSERT INTO messages (room_id, sender_name, message) VALUES ($1, $2, $3)', [roomId, 'Система', joinMessage]);
-        io.to(roomId).emit('receive_message', { from: { id: 'system', name: 'Система' }, text: joinMessage });
+      const isFirstJoin = !existingParticipant;
+      if (isFirstJoin) {
+        const joinMessage =
+          userId === creatorUserId
+            ? `${username} создал комнату`
+            : `${username} присоединился к комнате`;
+
+        await query('INSERT INTO messages (room_id, sender_name, message) VALUES ($1, $2, $3)', [
+          roomId,
+          'Система',
+          joinMessage,
+        ]);
+
+        io.to(roomId).emit('receive_message', {
+          from: { id: 'system', name: 'Система' },
+          text: joinMessage,
+        });
       }
 
       broadcastParticipants(roomId, roomData, sessionKey);
@@ -340,9 +402,11 @@ io.on('connection', (socket) => {
       socket.emit('joined', {
         roomId,
         participants: participantsArray(roomData, sessionKey),
-        isCreator: creatorUserId === userId,
+        isCreator: Number(creatorUserId) === Number(userId),
         creatorUserId,
       });
+      
+      socket.emit('active_room_info', { roomId });
     } catch (err) {
       console.error(err);
       socket.emit('error_message', 'Ошибка сервера');
