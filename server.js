@@ -1,16 +1,22 @@
-import express from "express";
-import cors from "cors";
+require('dotenv').config();
+const express = require('express');
+const http = require('http');
+const { Server } = require('socket.io');
+const cors = require('cors');
+const apiRoutes = require("./api");
+const initSocket = require("./socket");
+
+const PORT = process.env.PORT || 4000;
 
 const app = express();
-const PORT = 3000;
 
-app.use(cors());
+app.use(cors({ origin: '*', credentials: true }));
 app.use(express.json());
+app.use("/api", apiRoutes);
 
-app.get("/", (req, res) => {
-  res.send("Сервер работает! ✅");
-});
+const server = http.createServer(app);
+const io = new Server(server, { cors: { origin: '*', credentials: true } });
 
-app.listen(PORT, () => {
-  console.log(`Сервер запущен на http://localhost:${PORT}`);
-});
+initSocket(io);
+
+server.listen(PORT, () => console.log(`Server running on http://localhost:${PORT}`));
