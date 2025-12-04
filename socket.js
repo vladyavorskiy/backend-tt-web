@@ -1,6 +1,14 @@
 const { v4: uuidv4 } = require('uuid');
 const { query } = require("./db");
-const { activeRooms, sessionToRoom, broadcastParticipants, participantsArray, removeUserFromRoomBySession } = require("./utils/roomUtils");
+const { 
+  activeRooms, 
+  sessionToRoom, 
+  broadcastParticipants, 
+  participantsArray, 
+  removeUserFromRoomBySession,
+  getRoomData,
+  clearUserSocketData
+} = require("./utils/roomUtils");
 const { shuffleArray, finishGame, startTurnTimer, endTurnServer } = require("./utils/gameUtils");
 
 function initSocket(io) {
@@ -8,8 +16,7 @@ function initSocket(io) {
   require("./utils/gameUtils").setIo(io);
   
   io.on('connection', (socket) => {
-
-  console.log('Подключен:', socket.id);
+    console.log('Подключен:', socket.id);
 
   socket.on('check_active_room', async ({ userId }) => {
     try {
@@ -146,15 +153,61 @@ function initSocket(io) {
   });
 
   socket.on('leave_room_request', async () => {
-    const sessionId = socket.data.sessionId;
-    const roomId = socket.data.roomId;
-    if (!roomId || !activeRooms.has(roomId)) return socket.emit('error_message', 'Вы не в комнате');
+      console.log(`[leave_room_request] Запрос от socket ${socket.id}`);
+      
+      const sessionId = socket.data.sessionId;
+      const userId = socket.data.userId;
+      
+      if (!sessionId) {
+        console.log(`[leave_room_request] Нет sessionId у socket ${socket.id}`);
+        return socket.emit('leave_error', { message: 'Отсутствует идентификатор сессии' });
+      }
 
-    await removeUserFromRoomBySession(sessionId, true);
-    socket.leave(roomId);
-    socket.data.roomId = null;
-    socket.emit('left_room_success');
-  });
+      try {
+        const roomId = sessionToRoom.get(sessionId) || socket.data.roomId;
+        
+        if (!roomId) {
+          console.log(`[leave_room_request] Пользователь ${userId} не в комнате`);
+          return socket.emit('leave_error', { message: 'Вы не находитесь в комнате' });
+        }
+
+        console.log(`[leave_room_request] Пользователь ${userId} покидает комнату ${roomId}`);
+
+        const result = await removeUserFromRoomBySession(sessionId);
+        
+        if (!result.success) {
+          console.log(`[leave_room_request] Ошибка удаления: ${result.error}`);
+          return socket.emit('leave_error', { 
+            message: 'Не удалось выйти из комнаты', 
+            details: result.error 
+          });
+        }
+
+        socket.leave(roomId);
+        
+        delete socket.data.roomId;
+        
+        console.log(`[leave_room_request] Пользователь ${userId} успешно вышел из комнаты ${roomId}`);
+
+        socket.emit('left_room_success', { 
+          roomId,
+          userId,
+          userName: result.userName 
+        });
+
+        const roomData = activeRooms.get(roomId);
+        if (roomData && io) {
+          broadcastParticipants(roomId, roomData);
+        }
+
+      } catch (err) {
+        console.error('[leave_room_request] Необработанная ошибка:', err);
+        socket.emit('leave_error', { 
+          message: 'Внутренняя ошибка сервера',
+          code: 'INTERNAL_ERROR'
+        });
+      }
+    });
 
   socket.on('delete_room', async () => {
     const roomId = socket.data.roomId;
@@ -183,15 +236,25 @@ function initSocket(io) {
   });
 
   socket.on('disconnect', () => {
-    const { roomId, sessionId } = socket.data || {};
-    if (!roomId || !activeRooms.has(roomId)) return;
-
-    const roomData = activeRooms.get(roomId);
-    const user = roomData.participants.get(sessionId);
-    if (user) user.socketId = null;
-
-    console.log(`Пользователь ${sessionId} временно отключился`);
-  });
+      console.log(`Отключен: ${socket.id}`);
+      
+      const { roomId, sessionId, userId } = socket.data || {};
+      
+      if (sessionId && roomId) {
+        console.log(`[disconnect] Пользователь ${userId} отключился от комнаты ${roomId}`);
+        
+        clearUserSocketData(sessionId, socket.id);
+        
+        const roomData = activeRooms.get(roomId);
+        if (roomData) {
+          setTimeout(() => {
+            broadcastParticipants(roomId, roomData);
+          }, 1000);
+        }
+      } else {
+        console.log(`[disconnect] Отключился socket без данных комнаты: ${socket.id}`);
+      }
+    });
 
   socket.on('check_role', ({ roomId, userId }) => {
   console.log(`[check_role] Received request: roomId=${roomId}, userId=${userId}`);
