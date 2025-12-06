@@ -1,5 +1,5 @@
 const { v4: uuidv4 } = require('uuid');
-const { query } = require("./db");
+const { Room, RoomUser, User, Message, Game, GameWord, GameScore } = require("./models");
 const { 
   activeRooms, 
   sessionToRoom, 
@@ -28,12 +28,14 @@ function initSocket(io) {
         }
       }
 
-      const dbCheck = await query(
-        `SELECT room_id FROM room_users WHERE user_id = $1 LIMIT 1`,
-        [userId]
-      );
-      if (dbCheck.rowCount > 0) {
-        socket.emit('active_room_info', { roomId: dbCheck.rows[0].room_id });
+      const dbCheck = await RoomUser.findOne({
+        where: { user_id: userId },
+        attributes: ['room_id'],
+        order: [['joined_at', 'DESC']]
+      });
+      
+      if (dbCheck) {
+        socket.emit('active_room_info', { roomId: dbCheck.room_id });
       } else {
         socket.emit('active_room_info', null);
       }
@@ -53,30 +55,42 @@ function initSocket(io) {
     socket.data.roomId = roomId;
 
     try {
-      const roomRes = await query('SELECT id, creator_user_id FROM rooms WHERE id = $1', [roomId]);
-      if (roomRes.rowCount === 0) return socket.emit('room_not_found');
+      const room = await Room.findByPk(roomId, {
+        attributes: ['id', 'creator_user_id']
+      });
+      
+      if (!room) return socket.emit('room_not_found');
 
-      const creatorUserId = roomRes.rows[0].creator_user_id;
+      const creatorUserId = room.creator_user_id;
 
       if (!activeRooms.has(roomId)) {
-        const dbUsers = await query(
-          `SELECT ru.session_id, ru.user_id, ru.socket_id, u.username
-           FROM room_users ru
-           JOIN users u ON ru.user_id = u.id
-           WHERE ru.room_id = $1`,
-          [roomId]
-        );
+        const dbUsers = await RoomUser.findAll({
+          where: { room_id: roomId },
+          include: [
+            {
+              model: User,
+              attributes: ['username']
+            }
+          ]
+        });
+        
         const participantsMap = new Map();
-        dbUsers.rows.forEach(u => {
-          participantsMap.set(u.session_id, { userId: u.user_id, name: u.username, socketId: u.socket_id, sessionId: u.session_id });
+        dbUsers.forEach(u => {
+          participantsMap.set(u.session_id, { 
+            userId: u.user_id, 
+            name: u.User.username, 
+            socketId: u.socket_id, 
+            sessionId: u.session_id 
+          });
         });
         activeRooms.set(roomId, { creatorUserId, participants: participantsMap });
       }
 
       const roomData = activeRooms.get(roomId);
-      const userRes = await query('SELECT username FROM users WHERE id = $1', [userId]);
-      const username = userRes.rows[0]?.username || 'Неизвестный пользователь';
-      
+      const user = await User.findByPk(userId, {
+        attributes: ['username']
+      });
+      const username = user?.username || 'Неизвестный пользователь';
 
       let existingParticipant = Array.from(roomData.participants.values()).find(p => p.userId === userId);
 
@@ -85,26 +99,33 @@ function initSocket(io) {
         existingParticipant.socketId = socket.id;
         existingParticipant.sessionId = sessionKey;
 
-        await query(
-          `UPDATE room_users SET socket_id = $1, session_id = $2 WHERE room_id = $3 AND user_id = $4`,
-          [socket.id, sessionKey, roomId, userId]
+        await RoomUser.update(
+          { socket_id: socket.id, session_id: sessionKey },
+          { where: { room_id: roomId, user_id: userId } }
         );
       } else {
         console.log(`[join_room] Новый участник ${userId} вошел в комнату ${roomId}`);
         roomData.participants.set(sessionKey, { userId, name: username, socketId: socket.id, sessionId: sessionKey });
 
-        await query(
-          `INSERT INTO room_users (room_id, user_id, session_id, socket_id) VALUES ($1, $2, $3, $4)`,
-          [roomId, userId, sessionKey, socket.id]
-        );
+        await RoomUser.create({
+          room_id: roomId,
+          user_id: userId,
+          session_id: sessionKey,
+          socket_id: socket.id
+        });
       }
 
       sessionToRoom.set(sessionKey, roomId);
 
       socket.join(roomId);
 
-      const messagesRes = await query('SELECT sender_name, message, created_at FROM messages WHERE room_id = $1 ORDER BY created_at ASC', [roomId]);
-      socket.emit('chat_history', messagesRes.rows || []);
+      const messages = await Message.findAll({
+        where: { room_id: roomId },
+        attributes: ['sender_name', 'message', 'created_at'],
+        order: [['created_at', 'ASC']]
+      });
+      
+      socket.emit('chat_history', messages || []);
 
       const isFirstJoin = !existingParticipant;
       if (isFirstJoin) {
@@ -113,11 +134,11 @@ function initSocket(io) {
             ? `${username} создал комнату`
             : `${username} присоединился к комнате`;
 
-        await query('INSERT INTO messages (room_id, sender_name, message) VALUES ($1, $2, $3)', [
-          roomId,
-          'Система',
-          joinMessage,
-        ]);
+        await Message.create({
+          room_id: roomId,
+          sender_name: 'Система',
+          message: joinMessage,
+        });
 
         io.to(roomId).emit('receive_message', {
           from: { id: 'system', name: 'Система' },
@@ -145,10 +166,18 @@ function initSocket(io) {
     const roomId = socket.data.roomId;
     if (!roomId) return;
 
-    const userRes = await query('SELECT username FROM users WHERE id = $1', [socket.data.userId]);
-    const username = userRes.rows[0].username;
+    const user = await User.findByPk(socket.data.userId, {
+      attributes: ['username']
+    });
+    const username = user.username;
 
-    await query('INSERT INTO messages (room_id, user_id, sender_name, message) VALUES ($1, $2, $3, $4)', [roomId, socket.data.userId, username, message]);
+    await Message.create({
+      room_id: roomId,
+      user_id: socket.data.userId,
+      sender_name: username,
+      message: message
+    });
+    
     io.to(roomId).emit('receive_message', { from: { id: socket.data.userId, name: username }, text: message });
   });
 
@@ -178,7 +207,7 @@ function initSocket(io) {
         if (!result.success) {
           console.log(`[leave_room_request] Ошибка удаления: ${result.error}`);
           return socket.emit('leave_error', { 
-            message: 'Не удалось выйти из комнаты', 
+            message: 'Не удалось выйти из комната', 
             details: result.error 
           });
         }
@@ -220,9 +249,10 @@ function initSocket(io) {
     }
 
     io.to(roomId).emit('room_closed');
-    await query('DELETE FROM messages WHERE room_id = $1', [roomId]);
-    await query('DELETE FROM room_users WHERE room_id = $1', [roomId]);
-    await query('DELETE FROM rooms WHERE id = $1', [roomId]);
+    
+    await Message.destroy({ where: { room_id: roomId } });
+    await RoomUser.destroy({ where: { room_id: roomId } });
+    await Room.destroy({ where: { id: roomId } });
 
     for (const [sessId] of roomData.participants) sessionToRoom.delete(sessId);
 
@@ -274,42 +304,45 @@ socket.on("create_game", async ({ type, mode, roundTime, wordsPerPlayer }) => {
   if (!room) return;
 
   try {
-    const gameRes = await query(
-      `INSERT INTO games (room_id, creator_user_id, type, mode, round_time, words_per_player)
-       VALUES ($1, $2, $3, $4, $5, $6)
-       RETURNING id`,
-      [roomId, userId, type, mode, roundTime, wordsPerPlayer]
-    );
+    const game = await Game.create({
+      room_id: roomId,
+      creator_user_id: userId,
+      type,
+      mode,
+      round_time: roundTime,
+      words_per_player: wordsPerPlayer
+    });
 
-    const gameId = gameRes.rows[0].id;
+    const gameId = game.id;
 
-  const game = {
-    id: gameId,
-    type,               // тип игры
-    mode,               // solo / team
-    roundTime,          // время на раунд
-    wordsPerPlayer,     // сколько слов вводит каждый игрок
-    phase: "enterWords",
-    allWords: [],       // все слова, введённые игроками
-    roundWords: [],     // слова текущего раунда
-    guessedWords: [],   // угаданные слова
-    pairs: [],          // для solo режима
-    teams: [[], []],    // для team режима
-    scores: {},         // очки
-    currentRound: 0,
-    activePlayerIndex: 0,
-    wordsSubmitted: new Set(),
-  };
+    const gameData = {
+      id: gameId,
+      type,               // тип игры
+      mode,               // solo / team
+      roundTime,          // время на раунд
+      wordsPerPlayer,     // сколько слов вводит каждый игрок
+      phase: "enterWords",
+      allWords: [],       // все слова, введённые игроками
+      roundWords: [],     // слова текущего раунда
+      guessedWords: [],   // угаданные слова
+      pairs: [],          // для solo режима
+      teams: [[], []],    // для team режима
+      scores: {},         // очки
+      currentRound: 0,
+      activePlayerIndex: 0,
+      wordsSubmitted: new Set(),
+    };
 
-  room.currentGame = game;
-  console.log(room.participants.size);
-  io.to(roomId).emit("phase_changed", {
-    phase: "enterWords",
-    roundTime,
-    wordsPerPlayer,
-    waitingStatus: { submitted: 0, total: room.participants.size }
-  });
-  
+    room.currentGame = gameData;
+    console.log(room.participants.size);
+    
+    io.to(roomId).emit("phase_changed", {
+      phase: "enterWords",
+      roundTime,
+      wordsPerPlayer,
+      waitingStatus: { submitted: 0, total: room.participants.size }
+    });
+    
   } catch (err) {
     console.error("Ошибка при создании игры:", err);
     socket.emit("error_message", "Ошибка при создании игры");
@@ -324,44 +357,43 @@ socket.on("submit_words", async ({ words }) => {
   if (!game || game.phase !== "enterWords") return;
 
   try {
-    const insertValues = words.map(
-      (word, idx) => `('${game.id}', ${userId}, '${word.replace(/'/g, "''")}')`
-    ).join(',');
-
-    await query(
-      `INSERT INTO game_words (game_id, user_id, word)
-       VALUES ${insertValues}`
-    );
-
-  game.wordsSubmitted.add(socket.data.userId);
-  game.allWords.push(...words);
-
-  if (game.wordsSubmitted.size === room.participants.size) {
-    game.roundWords = shuffleArray([...game.allWords]);
-    game.currentRound = 0;
-    game.activePlayerIndex = 0;
-    game.phase = "prepare_round";
-
-    const participantsArray = Array.from(room.participants.values()).map(p => ({
-      id: p.userId,
-      name: p.name,
+    const wordRecords = words.map(word => ({
+      game_id: game.id,
+      user_id: userId,
+      word: word
     }));
-    
-    io.to(roomId).emit("phase_changed", {
-      phase: "prepare_round",
-      round: game.currentRound,
-      type: game.type,
-      mode: game.mode,
-      roundTime: game.roundTime,
-      wordsPerPlayer: game.wordsPerPlayer,
-      participants: participantsArray,
-    });
-  } else {
-    io.to(roomId).emit("waiting_for_players", {
-      submitted: game.wordsSubmitted.size,
-      total: room.participants.size,
-    });
-  }
+
+    await GameWord.bulkCreate(wordRecords);
+
+    game.wordsSubmitted.add(socket.data.userId);
+    game.allWords.push(...words);
+
+    if (game.wordsSubmitted.size === room.participants.size) {
+      game.roundWords = shuffleArray([...game.allWords]);
+      game.currentRound = 0;
+      game.activePlayerIndex = 0;
+      game.phase = "prepare_round";
+
+      const participantsArrayData = Array.from(room.participants.values()).map(p => ({
+        id: p.userId,
+        name: p.name,
+      }));
+      
+      io.to(roomId).emit("phase_changed", {
+        phase: "prepare_round",
+        round: game.currentRound,
+        type: game.type,
+        mode: game.mode,
+        roundTime: game.roundTime,
+        wordsPerPlayer: game.wordsPerPlayer,
+        participants: participantsArrayData,
+      });
+    } else {
+      io.to(roomId).emit("waiting_for_players", {
+        submitted: game.wordsSubmitted.size,
+        total: room.participants.size,
+      });
+    }
   } catch (err) {
     console.error("Ошибка при сохранении слов:", err);
     socket.emit("error_message", "Ошибка при сохранении слов");
@@ -446,7 +478,7 @@ socket.on("word_guessed", async () => {
   game.guessedWords.push(guessedWord);
 
   let currentPair;
- if (game.mode === "solo") {
+  if (game.mode === "solo") {
     currentPair = game.pairs[game.activePlayerIndex];
     const explainerId = currentPair.explainer.id;
     const guesserId = currentPair.guesser.id;
@@ -456,13 +488,13 @@ socket.on("word_guessed", async () => {
 
     try {
       for (const playerId of [explainerId, guesserId]) {
-        await query(
-          `INSERT INTO game_scores (game_id, user_id, score)
-           VALUES ($1, $2, 1)
-           ON CONFLICT (game_id, user_id)
-           DO UPDATE SET score = game_scores.score + 1`,
-          [game.id, playerId]
-        );
+        await GameScore.upsert({
+          game_id: game.id,
+          user_id: playerId,
+          score: (game.scores[playerId] || 0)
+        }, {
+          returning: false
+        });
       }
     } catch (err) {
       console.error("Ошибка обновления очков:", err);
