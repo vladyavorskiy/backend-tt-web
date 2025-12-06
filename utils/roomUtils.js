@@ -1,4 +1,4 @@
-const { query } = require("../db");
+const { Room, RoomUser, User, Message } = require("../models");
 
 const activeRooms = new Map();
 const sessionToRoom = new Map();
@@ -39,15 +39,15 @@ async function removeUserFromRoomBySession(sessionId) {
     if (!roomData) {
       console.log(`[removeUserFromRoomBySession] Комната ${roomId} не найдена в activeRooms`);
       
-      const dbCheck = await query(
-        'SELECT room_id FROM room_users WHERE session_id = $1',
-        [sessionId]
-      );
+      const dbCheck = await RoomUser.findOne({
+        where: { session_id: sessionId },
+        attributes: ['room_id']
+      });
       
-      if (dbCheck.rowCount > 0) {
-        await query('DELETE FROM room_users WHERE session_id = $1', [sessionId]);
+      if (dbCheck) {
+        await RoomUser.destroy({ where: { session_id: sessionId } });
         sessionToRoom.delete(sessionId);
-        return { success: true, roomId: dbCheck.rows[0].room_id };
+        return { success: true, roomId: dbCheck.room_id };
       }
       
       return { success: false, error: 'Комната не найдена' };
@@ -71,21 +71,22 @@ async function removeUserFromRoomBySession(sessionId) {
       console.log(`[removeUserFromRoomBySession] Комната ${roomId} пуста, удаляем из памяти`);
       activeRooms.delete(roomId);
       
-      await query('DELETE FROM room_users WHERE room_id = $1', [roomId]);
-      await query('DELETE FROM messages WHERE room_id = $1', [roomId]);
-      await query('DELETE FROM rooms WHERE id = $1', [roomId]);
+      await RoomUser.destroy({ where: { room_id: roomId } });
+      await Message.destroy({ where: { room_id: roomId } });
+      await Room.destroy({ where: { id: roomId } });
     } else {
-      await query('DELETE FROM room_users WHERE session_id = $1', [sessionId]);
+      await RoomUser.destroy({ where: { session_id: sessionId } });
     }
 
     if (roomData && io) {
       const leaveMessage = `${userName} вышел из комнаты`;
       
       try {
-        await query(
-          'INSERT INTO messages (room_id, sender_name, message) VALUES ($1, $2, $3)',
-          [roomId, 'Система', leaveMessage]
-        );
+        await Message.create({
+          room_id: roomId,
+          sender_name: 'Система',
+          message: leaveMessage,
+        });
         
         io.to(roomId).emit('receive_message', { 
           from: { id: 'system', name: 'Система' }, 
@@ -114,37 +115,41 @@ async function getRoomData(roomId) {
       return { data: roomData, source: 'memory' };
     }
 
-    const dbCheck = await query(
-      `SELECT r.id, r.creator_user_id, 
-              ru.session_id, ru.user_id, ru.socket_id,
-              u.username
-       FROM rooms r
-       LEFT JOIN room_users ru ON r.id = ru.room_id
-       LEFT JOIN users u ON ru.user_id = u.id
-       WHERE r.id = $1`,
-      [roomId]
-    );
+    const rooms = await Room.findAll({
+      where: { id: roomId },
+      include: [
+        {
+          model: RoomUser,
+          include: [
+            {
+              model: User,
+              attributes: ['username']
+            }
+          ]
+        }
+      ]
+    });
 
-    if (dbCheck.rowCount === 0) {
+    if (!rooms || rooms.length === 0) {
       return { data: null, source: 'none' };
     }
 
+    const room = rooms[0];
     const participantsMap = new Map();
-    let creatorUserId = null;
+    let creatorUserId = room.creator_user_id;
 
-    dbCheck.rows.forEach(row => {
-      if (row.session_id) {
-        participantsMap.set(row.session_id, {
-          userId: row.user_id,
-          name: row.username,
-          socketId: row.socket_id,
-          sessionId: row.session_id
-        });
-      }
-      if (!creatorUserId && row.creator_user_id) {
-        creatorUserId = row.creator_user_id;
-      }
-    });
+    if (room.RoomUsers && room.RoomUsers.length > 0) {
+      room.RoomUsers.forEach(roomUser => {
+        if (roomUser.session_id && roomUser.User) {
+          participantsMap.set(roomUser.session_id, {
+            userId: roomUser.user_id,
+            name: roomUser.User.username,
+            socketId: roomUser.socket_id,
+            sessionId: roomUser.session_id
+          });
+        }
+      });
+    }
 
     const restoredRoomData = {
       creatorUserId,
@@ -152,11 +157,14 @@ async function getRoomData(roomId) {
     };
 
     activeRooms.set(roomId, restoredRoomData);
-    dbCheck.rows.forEach(row => {
-      if (row.session_id) {
-        sessionToRoom.set(row.session_id, roomId);
-      }
-    });
+    
+    if (room.RoomUsers && room.RoomUsers.length > 0) {
+      room.RoomUsers.forEach(roomUser => {
+        if (roomUser.session_id) {
+          sessionToRoom.set(roomUser.session_id, roomId);
+        }
+      });
+    }
 
     return { data: restoredRoomData, source: 'database' };
 
