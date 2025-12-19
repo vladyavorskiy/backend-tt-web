@@ -198,14 +198,26 @@ function initSocket(io) {
         });
         const username = user.username;
 
+        let messageText;
+        if (typeof message === 'string') {
+          messageText = message;
+        } else if (typeof message === 'object' && message !== null) {
+          messageText = message.text || message.message || JSON.stringify(message);
+        } else {
+          messageText = String(message || '');
+        }
+
         await Message.create({
           room_id: roomId,
           user_id: socket.data.userId,
           sender_name: username,
-          message: message
+          message: messageText
         });
         
-        io.to(roomId).emit('receive_message', { from: { id: socket.data.userId, name: username }, text: message });
+        io.to(roomId).emit('receive_message', { 
+          from: { id: socket.data.userId, name: username }, 
+          text: messageText
+        });
       } catch (err) {
         console.error('[send_message] Ошибка:', err);
         socket.emit('error_message', 'Ошибка при отправке сообщения');
