@@ -1,4 +1,4 @@
-const { query } = require("../db");
+const { Game, GameScore, Message } = require("../models");
 const { activeRooms } = require("./roomUtils");
 
 function shuffleArray(array) {
@@ -13,7 +13,10 @@ async function finishGame(roomId) {
     if (!game) return;
 
     try {
-      await query(`UPDATE games SET ended_at = NOW() WHERE id = $1`, [game.id]);
+      await Game.update(
+        { ended_at: new Date() },
+        { where: { id: game.id } }
+      );
     } catch (err) {
       console.warn("finishGame: couldn't set ended_at (maybe column absent).", err.message || err);
     }
@@ -22,13 +25,11 @@ async function finishGame(roomId) {
       const entries = Object.entries(game.scores);
       for (const [userIdStr, scoreValue] of entries) {
         const userId = Number(userIdStr);
-        await query(
-          `INSERT INTO game_scores (game_id, user_id, score)
-           VALUES ($1, $2, $3)
-           ON CONFLICT (game_id, user_id)
-           DO UPDATE SET score = EXCLUDED.score`,
-          [game.id, userId, Number(scoreValue) || 0]
-        );
+        await GameScore.upsert({
+          game_id: game.id,
+          user_id: userId,
+          score: Number(scoreValue) || 0
+        });
       }
     }
 
@@ -51,11 +52,12 @@ async function finishGame(roomId) {
     const leaveMessage = scoreText.length ? `Игра завершена — итоговый счёт: ${scoreText}` : `Игра завершена.`;
 
     try {
-      await query(
-        `INSERT INTO messages (room_id, user_id, sender_name, message)
-         VALUES ($1, NULL, $2, $3)`,
-        [roomId, 'Система', leaveMessage]
-      );
+      await Message.create({
+        room_id: roomId,
+        user_id: null,
+        sender_name: 'Система',
+        message: leaveMessage
+      });
     } catch (err) {
       console.warn("finishGame: failed to insert message", err.message || err);
     }
